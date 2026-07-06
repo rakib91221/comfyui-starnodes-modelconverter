@@ -12,7 +12,8 @@ from collections import Counter, OrderedDict
 
 try:
     import comfy_kitchen as ck
-    from comfy_kitchen.tensor import TensorCoreNVFP4Layout, TensorWiseINT8Layout
+    from comfy_kitchen.registry import registry as ck_registry
+    from comfy_kitchen.tensor import TensorCoreMXFP8Layout, TensorCoreNVFP4Layout, TensorWiseINT8Layout
 except ImportError:
     print("⚠️ [Star Ultimate Model Converter] comfy-kitchen not found.")
 
@@ -23,11 +24,11 @@ EXTENDED_METADATA_KEYS = ["config", "license", "encrypted_wandb_properties"]
 
 AIO_MODEL_PREFIX = "model.diffusion_model."
 
-TARGET_FORMATS = ["nvfp4", "fp8", "int8", "int8_convrot", "fp16", "fp32"]
+TARGET_FORMATS = ["nvfp4", "fp8", "mxfp8", "int8", "int8_convrot", "fp16", "fp32"]
 
 CONVROT_GROUPSIZE = 256
 
-PRECISION_RE = re.compile(r"[-_.](fp32|fp16|bf16|fp8(?:_e[45]m[23](?:fn)?)?(?:_scaled)?(?:_fast)?|int8(?:_convrot)?|nvfp4)(?=[-_.]|$)", re.IGNORECASE)
+PRECISION_RE = re.compile(r"[-_.](fp32|fp16|bf16|mxfp8|fp8(?:_e[45]m[23](?:fn)?)?(?:_scaled)?(?:_fast)?|int8(?:_convrot)?|nvfp4)(?=[-_.]|$)", re.IGNORECASE)
 
 FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
@@ -107,6 +108,31 @@ def load_aio_model(checkpoint_name):
     return sd, ckpt_path
 
 
+def pick_mxfp8_backend(device):
+    """Pick a working comfy_kitchen backend for MXFP8 quantization.
+
+    The 'cuda' backend passes float8 tensors through DLPack, which some torch
+    versions reject ('float8 types are not supported by dlpack'). Probe once
+    and fall back to the triton/eager backends, which do not use DLPack.
+    Returns None if the default auto-selected backend works.
+    """
+    probe = torch.randn(32, 32, device=device, dtype=torch.float32)
+    try:
+        TensorCoreMXFP8Layout.quantize(probe)
+        return None
+    except Exception as e:
+        print(f"\u26a0\ufe0f MXFP8 default backend failed ({e}). Trying fallback backends...")
+    for backend in ("triton", "eager"):
+        try:
+            with ck_registry.use_backend(backend):
+                TensorCoreMXFP8Layout.quantize(probe)
+            print(f"\u2705 MXFP8: using '{backend}' backend")
+            return backend
+        except Exception:
+            continue
+    raise RuntimeError("MXFP8 quantization is not supported by any comfy_kitchen backend in this environment. Try updating comfy-kitchen and PyTorch.")
+
+
 def build_output_path(out_dir, base_name, target_format):
     stem = PRECISION_RE.sub("", base_name).rstrip("-_.")
     return os.path.join(out_dir, f"{stem}-{target_format}.safetensors")
@@ -132,10 +158,24 @@ def dequantize_input(sd, metadata):
     quant_layers = {}
     if metadata and "_quantization_metadata" in metadata:
         quant_layers = json.loads(metadata["_quantization_metadata"]).get("layers", {})
-        if any(info.get("format") == "nvfp4" for info in quant_layers.values()):
-            raise ValueError("Input model contains NVFP4 layers, which cannot be dequantized losslessly. Use a higher precision source model.")
-        if any(info.get("convrot") for info in quant_layers.values()):
-            raise ValueError("Input model contains ConvRot-rotated INT8 layers. Use a higher precision source model.")
+
+    # Embedded per-layer configs: '.comfy_quant' uint8 JSON tensors from previously quantized models.
+    # These must never be carried over into the output (a bf16 cast of them breaks ComfyUI's loader).
+    for k in [k for k in sd if k.endswith(".comfy_quant")]:
+        conf = sd.pop(k)
+        layer = k[: -len(".comfy_quant")]
+        if layer not in quant_layers:
+            try:
+                quant_layers[layer] = json.loads(bytes(conf.cpu().to(torch.uint8).tolist()))
+            except Exception:
+                print(f"⚠️ Could not parse embedded quant config for '{layer}', ignoring.")
+
+    for layer, info in quant_layers.items():
+        fmt = info.get("format")
+        if fmt in ("nvfp4", "mxfp8"):
+            raise ValueError(f"Input model contains {fmt} layers ('{layer}'), which cannot be dequantized losslessly. Use a higher precision source model.")
+        if info.get("convrot"):
+            raise ValueError(f"Input model contains ConvRot-rotated INT8 layers ('{layer}'). Use a higher precision source model.")
 
     # ComfyUI scaled fp8 checkpoints: 'scaled_fp8' marker + per-layer '.scale_weight' keys
     if "scaled_fp8" in sd:
@@ -182,7 +222,7 @@ class StarUltimateModelConverter:
                 }),
                 "target_format": (TARGET_FORMATS, {
                     "default": "nvfp4",
-                    "tooltip": "Target quantization format: nvfp4 (smallest, NVIDIA only), fp8 (small, good quality), int8 (compatible), int8_convrot (int8 with Hadamard rotation, better quality), fp16 (standard), fp32 (full precision)."
+                    "tooltip": "Target quantization format: nvfp4 (smallest, NVIDIA only), fp8 (small, good quality), mxfp8 (OCP Microscaling 8-bit, hardware-efficient block scaling offering near FP16 quality), int8 (compatible), int8_convrot (int8 with Hadamard rotation, better quality), fp16 (standard), fp32 (full precision)."
                 }),
                 "device": (["cuda", "cpu"], {
                     "default": "cuda",
@@ -260,6 +300,7 @@ class StarUltimateModelConverter:
 
         pbar = comfy.utils.ProgressBar(len(sd))
         print(f"⚙️ Converting on: {device}")
+        mxfp8_backend = pick_mxfp8_backend(device) if target_format == "mxfp8" else None
 
         if target_format in ("fp16", "fp32"):
             target_dtype = torch.float16 if target_format == "fp16" else torch.float32
@@ -304,25 +345,49 @@ class StarUltimateModelConverter:
                     if target_format in ("int8", "int8_convrot"):
                         layout = TensorWiseINT8Layout
                         fmt_name = "int8_tensorwise"
+                    elif target_format == "mxfp8":
+                        layout = TensorCoreMXFP8Layout
+                        fmt_name = "mxfp8"
                     else:
                         layout = TensorCoreNVFP4Layout
                         fmt_name = "nvfp4"
                     print(f"💎 {target_format.upper()}: {k}")
+                    
                     try:
+                        # Workaround 1: .contiguous() garantiert ein sauberes Speicher-Layout, 
+                        # was externe Kernel-Abstürze bei der Quantisierung verhindert.
+                        v_tensor_ready = v_tensor.float().contiguous()
+
                         if convrot:
-                            qdata, params = layout.quantize(v_tensor.float(), per_channel=True, convrot=True, convrot_groupsize=CONVROT_GROUPSIZE)
+                            qdata, params = layout.quantize(v_tensor_ready, per_channel=True, convrot=True, convrot_groupsize=CONVROT_GROUPSIZE)
+                        elif mxfp8_backend is not None:
+                            with ck_registry.use_backend(mxfp8_backend):
+                                qdata, params = layout.quantize(v_tensor_ready)
                         else:
-                            qdata, params = layout.quantize(v_tensor)
+                            qdata, params = layout.quantize(v_tensor_ready)
+                            
                         tensors = layout.state_dict_tensors(qdata, params)
+                        
                         for suffix, tensor in tensors.items():
-                            new_sd[f"{base_k_file}.weight{suffix}"] = tensor.cpu()
+                            # ComfyUI's safetensors reader has no F8_E8M0 dtype; its loader expects
+                            # E8M0 block scales stored as uint8 on disk and re-views them at load time.
+                            if tensor.dtype == torch.float8_e8m0fnu:
+                                new_sd[f"{base_k_file}.weight{suffix}"] = tensor.view(torch.uint8).cpu()
+                            # Workaround 2: Wir tarnen fehleranfällige float8 DLPack-Transfers als uint8
+                            elif tensor.dtype in FP8_DTYPES:
+                                new_sd[f"{base_k_file}.weight{suffix}"] = tensor.view(torch.uint8).cpu().view(tensor.dtype)
+                            else:
+                                new_sd[f"{base_k_file}.weight{suffix}"] = tensor.cpu()
+                                
                         layer_conf = {"format": fmt_name}
                         if convrot:
                             layer_conf["convrot"] = True
                             layer_conf["convrot_groupsize"] = CONVROT_GROUPSIZE
                         quant_map["layers"][base_k_meta] = layer_conf
                         counts[target_format] += 1
-                    except Exception:
+                        
+                    except Exception as e:
+                        print(f"⚠️ Quantization failed for {k}: {e}")
                         new_sd[k] = v.to(dtype=torch.bfloat16)
                         counts["kept bf16"] += 1
 

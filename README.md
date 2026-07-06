@@ -12,7 +12,7 @@ ComfyUI custom nodes for converting, quantizing and splitting diffusion models.
 
 ## Features
 
-- **Multiple Format Support**: Convert models to NVFP4, FP8, INT8, INT8 ConvRot, FP16, or FP32
+- **Multiple Format Support**: Convert models to NVFP4, FP8, MXFP8, INT8, INT8 ConvRot, FP16, or FP32
 - **Smart Layer Preservation**: Architecture-specific profiles ensure critical layers stay in high precision
 - **Automatic Dequantization**: Intelligently handles pre-quantized models for clean re-quantization
 - **Multi-Shard Support**: Seamlessly processes models split across multiple .safetensors files
@@ -81,6 +81,7 @@ Choose the model architecture profile. This determines which layers to keep in h
 #### **target_format**
 - **nvfp4**: Smallest size (~25% of original), NVIDIA GPUs only, excellent quality
 - **fp8**: Small size (~50% of original), good quality, NVIDIA GPUs recommended
+- **mxfp8**: OCP Microscaling 8-bit standard that uses hardware-efficient microscaling (block scaling) to achieve excellent visual quality, near FP16
 - **int8**: Compatible with most hardware, moderate compression
 - **int8_convrot**: INT8 with block-Hadamard weight rotation (ConvRot), better quality than plain INT8, requires ComfyUI v0.27.0+
 - **fp16**: Standard half precision, widely compatible
@@ -152,6 +153,7 @@ The node outputs a status string listing each saved component with its tensor co
 |--------|------|---------|---------------|-------|
 | NVFP4  | ★★★★★ | ★★★★☆ | NVIDIA only | ★★★★★ |
 | FP8    | ★★★★☆ | ★★★★☆ | NVIDIA recommended | ★★★★☆ |
+| MXFP8  | ★★★★☆ | ★★★★★ | Growing (OCP Standard) | ★★★★★ |
 | INT8   | ★★★☆☆ | ★★★☆☆ | Most hardware | ★★★☆☆ |
 | INT8 ConvRot | ★★★☆☆ | ★★★★☆ | ComfyUI v0.27.0+ | ★★★☆☆ |
 | FP16   | ★★☆☆☆ | ★★★★★ | All hardware | ★★★★☆ |
@@ -222,6 +224,7 @@ pip install comfy-kitchen
 
 - **NVFP4**: 4-bit floating point using NVIDIA Tensor Cores
 - **FP8**: 8-bit floating point (e4m3fn format)
+- **MXFP8**: OCP Microscaling 8-bit floating point (e4m3 data with power-of-2 E8M0 block scales, block size 32)
 - **INT8**: 8-bit integer with per-tensor scaling
 - **INT8 ConvRot**: 8-bit integer with per-channel scaling and group-wise Hadamard rotation (group size 256)
 - **FP16/FP32**: Standard IEEE floating point
