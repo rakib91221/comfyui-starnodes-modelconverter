@@ -1,4 +1,4 @@
-# ⭐ Starnodes Model Converter
+# ⭐ Starnodes Model Converter v1.1.0
 
 ComfyUI custom nodes for converting, quantizing and splitting diffusion models.
 
@@ -12,7 +12,7 @@ ComfyUI custom nodes for converting, quantizing and splitting diffusion models.
 
 ## Features
 
-- **Multiple Format Support**: Convert models to NVFP4, FP8, MXFP8, INT8, INT8 ConvRot, FP16, or FP32
+- **Multiple Format Support**: Convert models to NVFP4, FP8, MXFP8, INT8, INT8 ConvRot, INT4 ConvRot, FP16, or FP32
 - **Smart Layer Preservation**: Architecture-specific profiles ensure critical layers stay in high precision
 - **Automatic Dequantization**: Intelligently handles pre-quantized models for clean re-quantization
 - **Multi-Shard Support**: Seamlessly processes models split across multiple .safetensors files
@@ -53,11 +53,22 @@ Each profile has carefully tuned blacklists to preserve model quality while maxi
 
 ## Requirements
 
-- **ComfyUI**: Latest version recommended
-- **comfy-kitchen**: Required for NVFP4, FP8, and INT8 quantization
+- **ComfyUI**: Latest version recommended (v0.27.0+ for INT8/INT4 ConvRot)
+- **comfy-kitchen**: Required for NVFP4, FP8, MXFP8, INT8, and INT4 quantization
 - **PyTorch**: 2.0+ with CUDA support (for GPU acceleration)
 - **safetensors**: For model loading and saving
-- **NVIDIA GPU**: Required for NVFP4 format, recommended for FP8/INT8
+- **NVIDIA GPU**: Required for NVFP4 format, recommended for FP8/MXFP8/INT8/INT4
+
+### System Requirements
+
+- **RAM**: **64GB+ recommended** for large models (Flux, LTX, etc.)
+- **Pagefile**: If you encounter memory issues, set a **100GB+ pagefile** (Windows) or swap space (Linux)
+- **Device Selection**: Use `cpu` device for conversion if GPU memory is insufficient - it's slower but works with large models
+
+**Memory Tips:**
+- Large models (20GB+) may require significant system RAM during conversion
+- If conversion fails with out-of-memory errors, try using `device: cpu` instead of `cuda`
+- Windows users: Set a large pagefile via System Properties → Advanced → Performance Settings → Advanced → Virtual Memory
 
 ## Usage
 
@@ -84,6 +95,7 @@ Choose the model architecture profile. This determines which layers to keep in h
 - **mxfp8**: OCP Microscaling 8-bit standard that uses hardware-efficient microscaling (block scaling) to achieve excellent visual quality, near FP16
 - **int8**: Compatible with most hardware, moderate compression
 - **int8_convrot**: INT8 with block-Hadamard weight rotation (ConvRot), better quality than plain INT8, requires ComfyUI v0.27.0+
+- **int4_convrot**: INT4 with block-Hadamard weight rotation (ConvRot), smallest size (~25% of original), excellent quality-to-size ratio, requires SM 8.0+ (Ampere/Ada/Blackwell)
 - **fp16**: Standard half precision, widely compatible
 - **fp32**: Full precision, no compression
 
@@ -156,6 +168,7 @@ The node outputs a status string listing each saved component with its tensor co
 | MXFP8  | ★★★★☆ | ★★★★★ | Growing (OCP Standard) | ★★★★★ |
 | INT8   | ★★★☆☆ | ★★★☆☆ | Most hardware | ★★★☆☆ |
 | INT8 ConvRot | ★★★☆☆ | ★★★★☆ | ComfyUI v0.27.0+ | ★★★☆☆ |
+| INT4 ConvRot | ★★★★★ | ★★★★☆ | SM 8.0+ (Ampere+) | ★★★★☆ |
 | FP16   | ★★☆☆☆ | ★★★★★ | All hardware | ★★★★☆ |
 | FP32   | ★☆☆☆☆ | ★★★★★ | All hardware | ★★☆☆☆ |
 
@@ -227,6 +240,7 @@ pip install comfy-kitchen
 - **MXFP8**: OCP Microscaling 8-bit floating point (e4m3 data with power-of-2 E8M0 block scales, block size 32)
 - **INT8**: 8-bit integer with per-tensor scaling
 - **INT8 ConvRot**: 8-bit integer with per-channel scaling and group-wise Hadamard rotation (group size 256)
+- **INT4 ConvRot**: 4-bit integer with per-group scaling and group-wise Hadamard rotation (rotation group size 256, quantization group size 64). Weights are packed as signed int8 (2 nibbles per byte) with fp32 per-group scales.
 - **FP16/FP32**: Standard IEEE floating point
 
 ### File Naming
@@ -254,9 +268,15 @@ Developed for the ComfyUI community with support for modern quantization techniq
 
 ## Changelog
 
+### v1.1.0 (2025-01-10)
+- ✨ **New Format**: Added INT4 ConvRot support - 4-bit quantization with Hadamard rotation for ~25% model size
+- 📝 **System Requirements**: Added RAM and pagefile recommendations (64GB+ RAM, 100GB+ pagefile for large models)
+- 🔧 **Hardware**: INT4 ConvRot requires SM 8.0+ (Ampere/Ada/Blackwell GPUs)
+- 📚 **Documentation**: Updated format comparison table and technical details
+
 ### v1.0.0
-- Initial release with multi-format support
+- Initial release with NVFP4, FP8, MXFP8, INT8, INT8 ConvRot support
+- Smart layer preservation with architecture-specific profiles
+- AIO checkpoint splitter node
 - Architecture-specific profiles for 15+ model families
 - Automatic dequantization and metadata preservation
-- Custom path support with toggle
-- Comprehensive tooltips and documentation

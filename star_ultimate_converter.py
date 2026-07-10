@@ -13,7 +13,7 @@ from collections import Counter, OrderedDict
 try:
     import comfy_kitchen as ck
     from comfy_kitchen.registry import registry as ck_registry
-    from comfy_kitchen.tensor import TensorCoreMXFP8Layout, TensorCoreNVFP4Layout, TensorWiseINT8Layout
+    from comfy_kitchen.tensor import TensorCoreConvRotW4A4Layout, TensorCoreMXFP8Layout, TensorCoreNVFP4Layout, TensorWiseINT8Layout
 except ImportError:
     print("⚠️ [Star Ultimate Model Converter] comfy-kitchen not found.")
 
@@ -24,11 +24,12 @@ EXTENDED_METADATA_KEYS = ["config", "license", "encrypted_wandb_properties"]
 
 AIO_MODEL_PREFIX = "model.diffusion_model."
 
-TARGET_FORMATS = ["nvfp4", "fp8", "mxfp8", "int8", "int8_convrot", "fp16", "fp32"]
+TARGET_FORMATS = ["nvfp4", "fp8", "mxfp8", "int8", "int8_convrot", "int4_convrot", "fp16", "fp32"]
 
 CONVROT_GROUPSIZE = 256
+INT4_QUANT_GROUPSIZE = 64
 
-PRECISION_RE = re.compile(r"[-_.](fp32|fp16|bf16|mxfp8|fp8(?:_e[45]m[23](?:fn)?)?(?:_scaled)?(?:_fast)?|int8(?:_convrot)?|nvfp4)(?=[-_.]|$)", re.IGNORECASE)
+PRECISION_RE = re.compile(r"[-_.](fp32|fp16|bf16|mxfp8|fp8(?:_e[45]m[23](?:fn)?)?(?:_scaled)?(?:_fast)?|int[48](?:_convrot)?|nvfp4)(?=[-_.]|$)", re.IGNORECASE)
 
 FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
@@ -172,9 +173,9 @@ def dequantize_input(sd, metadata):
 
     for layer, info in quant_layers.items():
         fmt = info.get("format")
-        if fmt in ("nvfp4", "mxfp8"):
+        if fmt in ("nvfp4", "mxfp8", "convrot_w4a4"):
             raise ValueError(f"Input model contains {fmt} layers ('{layer}'), which cannot be dequantized losslessly. Use a higher precision source model.")
-        if info.get("convrot"):
+        if info.get("convrot") and fmt != "convrot_w4a4":
             raise ValueError(f"Input model contains ConvRot-rotated INT8 layers ('{layer}'). Use a higher precision source model.")
 
     # ComfyUI scaled fp8 checkpoints: 'scaled_fp8' marker + per-layer '.scale_weight' keys
@@ -222,7 +223,7 @@ class StarUltimateModelConverter:
                 }),
                 "target_format": (TARGET_FORMATS, {
                     "default": "nvfp4",
-                    "tooltip": "Target quantization format: nvfp4 (smallest, NVIDIA only), fp8 (small, good quality), mxfp8 (OCP Microscaling 8-bit, hardware-efficient block scaling offering near FP16 quality), int8 (compatible), int8_convrot (int8 with Hadamard rotation, better quality), fp16 (standard), fp32 (full precision)."
+                    "tooltip": "Target quantization format: nvfp4 (smallest, NVIDIA only), fp8 (small, good quality), mxfp8 (OCP Microscaling 8-bit, hardware-efficient block scaling offering near FP16 quality), int8 (compatible), int8_convrot (int8 with Hadamard rotation, better quality), int4_convrot (int4 with Hadamard rotation, smallest size, requires SM 8.0+), fp16 (standard), fp32 (full precision)."
                 }),
                 "device": (["cuda", "cpu"], {
                     "default": "cuda",
@@ -341,10 +342,14 @@ class StarUltimateModelConverter:
                         if device == "cuda": del v_tensor
                         continue
 
-                    convrot = target_format == "int8_convrot"
+                    int8_convrot = target_format == "int8_convrot"
+                    int4_convrot = target_format == "int4_convrot"
                     if target_format in ("int8", "int8_convrot"):
                         layout = TensorWiseINT8Layout
                         fmt_name = "int8_tensorwise"
+                    elif target_format == "int4_convrot":
+                        layout = TensorCoreConvRotW4A4Layout
+                        fmt_name = "convrot_w4a4"
                     elif target_format == "mxfp8":
                         layout = TensorCoreMXFP8Layout
                         fmt_name = "mxfp8"
@@ -358,8 +363,10 @@ class StarUltimateModelConverter:
                         # was externe Kernel-Abstürze bei der Quantisierung verhindert.
                         v_tensor_ready = v_tensor.float().contiguous()
 
-                        if convrot:
+                        if int8_convrot:
                             qdata, params = layout.quantize(v_tensor_ready, per_channel=True, convrot=True, convrot_groupsize=CONVROT_GROUPSIZE)
+                        elif int4_convrot:
+                            qdata, params = layout.quantize(v_tensor_ready, convrot_groupsize=CONVROT_GROUPSIZE, quant_group_size=INT4_QUANT_GROUPSIZE)
                         elif mxfp8_backend is not None:
                             with ck_registry.use_backend(mxfp8_backend):
                                 qdata, params = layout.quantize(v_tensor_ready)
@@ -380,9 +387,12 @@ class StarUltimateModelConverter:
                                 new_sd[f"{base_k_file}.weight{suffix}"] = tensor.cpu()
                                 
                         layer_conf = {"format": fmt_name}
-                        if convrot:
+                        if int8_convrot:
                             layer_conf["convrot"] = True
                             layer_conf["convrot_groupsize"] = CONVROT_GROUPSIZE
+                        elif int4_convrot:
+                            layer_conf["convrot_groupsize"] = CONVROT_GROUPSIZE
+                            layer_conf["quant_group_size"] = INT4_QUANT_GROUPSIZE
                         quant_map["layers"][base_k_meta] = layer_conf
                         counts[target_format] += 1
                         
