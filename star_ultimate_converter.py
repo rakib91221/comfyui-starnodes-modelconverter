@@ -246,13 +246,13 @@ class StarUltimateModelConverter:
 
         return {
             "required": {
-                "mode": (["Diffusion Model", "Checkpoint", "Text-Encoder", "Custom Path"], {
+                "mode": (["Diffusion Model", "Checkpoint", "AIO", "Text-Encoder", "Custom Path"], {
                     "default": "Diffusion Model",
-                    "tooltip": "Select the source type. The script will only process the file selected in the corresponding dropdown below."
+                    "tooltip": "Select the source type. 'AIO' processes UNet + CLIP together and ignores VAE."
                 }),
                 "diffusion_model": (diff_list, {"tooltip": "Used if Mode is 'Diffusion Model'."}),
-                "checkpoint": (ckpt_list, {"tooltip": "Used if Mode is 'Checkpoint'. Extracts UNet only."}),
-                "text_encoder": (tenc_list, {"tooltip": "Used if Mode is 'Text-Encoder'. Shows models from both 'clip' and 'text_encoders' folders."}),
+                "checkpoint": (ckpt_list, {"tooltip": "Used if Mode is 'Checkpoint' or 'AIO'."}),
+                "text_encoder": (tenc_list, {"tooltip": "Used if Mode is 'Text-Encoder'."}),
                 "model_type": (list(configs["models"].keys()), {
                     "tooltip": "Choose the model architecture profile."
                 }),
@@ -282,20 +282,43 @@ class StarUltimateModelConverter:
     def convert(self, mode, diffusion_model, checkpoint, text_encoder, model_type, target_format, device, custom_path=""):
         configs = load_model_configs()
         blacklist, fp8_layers, preserve_extended = get_profile(configs, model_type)
+        
+        # Lade sicherheitshalber auch gleich das Text-Encoder Profil für den AIO Modus mit
+        te_blacklist, te_fp8_layers, _ = get_profile(configs, "Text-Encoder")
+        
         start_time = time.time()
 
         print(f"🚀 [Star Ultimate Model Converter] Mode: {mode} | Profile: {model_type} | Target: {target_format}")
 
-        if mode == "Checkpoint":
+        if mode in ("Checkpoint", "AIO"):
             if not checkpoint or checkpoint == "None":
-                raise ValueError("Mode is 'Checkpoint' but no checkpoint is selected. Please choose a model from the dropdown.")
-            print(f"✂️ Extracting diffusion model from AIO checkpoint: {checkpoint}")
-            sd, ckpt_path = load_aio_model(checkpoint)
-            files = [ckpt_path]
-            orig_meta = None
+                raise ValueError(f"Mode is '{mode}' but no checkpoint is selected. Please choose a model from the dropdown.")
+            
+            ckpt_path = folder_paths.get_full_path("checkpoints", checkpoint)
             base_name = os.path.splitext(os.path.basename(ckpt_path))[0]
-            output_path = build_output_path(diffusion_models_dir(), base_name, target_format)
-            input_bytes = sum(v.numel() * v.element_size() for v in sd.values())
+            
+            # Originale Metadaten aus dem Checkpoint retten
+            orig_meta = None
+            if ckpt_path.endswith(".safetensors"):
+                with safetensors.safe_open(ckpt_path, framework="pt") as f:
+                    orig_meta = f.metadata()
+            
+            full_sd = comfy.utils.load_torch_file(ckpt_path, safe_load=True)
+
+            if mode == "Checkpoint":
+                print(f"✂️ Extracting diffusion model from AIO checkpoint: {checkpoint}")
+                sd = {k[len(AIO_MODEL_PREFIX):]: v for k, v in full_sd.items() if k.startswith(AIO_MODEL_PREFIX)}
+                input_bytes = sum(v.numel() * v.element_size() for v in sd.values())
+                output_path = build_output_path(diffusion_models_dir(), base_name, target_format)
+                files = [ckpt_path]
+                del full_sd # Speicher freigeben
+            else:
+                print(f"🔄 AIO Mode: Processing entire checkpoint intact: {checkpoint}")
+                sd = full_sd # Wir behalten das volle Dictionary!
+                input_bytes = os.path.getsize(ckpt_path)
+                checkpoints_dir = folder_paths.get_folder_paths("checkpoints")[0]
+                output_path = build_output_path(checkpoints_dir, f"{base_name}_AIO", target_format)
+                files = [ckpt_path]
         else:
             files, out_dir, base_name = resolve_input(mode, diffusion_model, checkpoint, text_encoder, custom_path)
             output_path = build_output_path(out_dir, base_name, target_format)
@@ -338,7 +361,33 @@ class StarUltimateModelConverter:
             for i, (k, v) in enumerate(sd.items()):
                 pbar.update_absolute(i + 1)
 
-                if any(name in k for name in blacklist):
+                # --- Dynamische Blacklist-Zuweisung ---
+                if mode == "AIO":
+                    if k.startswith(AIO_MODEL_PREFIX):
+                        # Es ist das Diffusion Model
+                        active_blacklist = blacklist
+                        active_fp8 = fp8_layers
+                    elif k.startswith("cond_stage_model.") or k.startswith("conditioner.") or k.startswith("text_encoders."):
+                        # Es ist ein Text-Encoder (CLIP/T5)
+                        active_blacklist = te_blacklist
+                        active_fp8 = te_fp8_layers
+                    else:
+                        # Es ist das VAE (first_stage_model) oder andere strukturelle Keys.
+                        # Auf GAR KEINEN FALL quantisieren!
+                        if v.dtype.is_floating_point:
+                            new_sd[k] = v.to(dtype=torch.bfloat16)
+                            counts["kept bf16 (VAE/Misc)"] += 1
+                        else:
+                            new_sd[k] = v
+                            counts["kept (VAE/Misc)"] += 1
+                        continue
+                else:
+                    # Normaler Modus (Stand-alone Modell)
+                    active_blacklist = blacklist
+                    active_fp8 = fp8_layers
+                # ----------------------------------------
+
+                if any(name in k for name in active_blacklist):
                     if v.dtype.is_floating_point:
                         new_sd[k] = v.to(dtype=torch.bfloat16)
                         counts["kept bf16"] += 1
@@ -349,14 +398,14 @@ class StarUltimateModelConverter:
 
                 if v.ndim == 2 and ".weight" in k:
                     base_k_file = k.replace(".weight", "")
-                    if "model.diffusion_model." in base_k_file:
-                        base_k_meta = base_k_file.split("model.diffusion_model.")[-1]
-                    else:
-                        base_k_meta = base_k_file
+                    # The metadata keys must exactly match the base keys
+                    base_k_meta = base_k_file
 
+                    # THIS LINE WAS LIKELY MISSING:
                     v_tensor = v.to(device=device, dtype=torch.bfloat16)
 
-                    if target_format == "fp8" or (fp8_layers and any(name in k for name in fp8_layers)):
+                    # Hier nutzen wir active_fp8 anstelle von fp8_layers
+                    if target_format == "fp8" or (active_fp8 and any(name in k for name in active_fp8)):
                         print(f"🌸 FP8: {k}")
                         weight_scale = (v_tensor.abs().max() / 448.0).clamp(min=1e-12).float()
                         weight_quantized = ck.quantize_per_tensor_fp8(v_tensor, weight_scale)
@@ -450,7 +499,9 @@ class StarUltimateModelConverter:
         reduction = (1 - output_bytes / input_bytes) * 100 if input_bytes else 0
         print(f"✅ Done. Final size: {format_size(output_bytes)}")
 
-        if mode == "Checkpoint":
+        if mode == "AIO":
+            input_desc = f"Full AIO Checkpoint {os.path.basename(files[0])}"
+        elif mode == "Checkpoint":
             input_desc = f"diffusion model from AIO checkpoint {os.path.basename(files[0])}"
         elif len(files) > 1:
             input_desc = f"{len(files)} files from {os.path.basename(os.path.dirname(files[0]))}"
