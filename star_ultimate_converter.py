@@ -73,10 +73,12 @@ def get_profile(configs, model_type):
     )
 
 
-def resolve_input(model_name, custom_path, use_custom_path):
-    """Return (list of safetensors files, output dir, base name for the output file)."""
-    custom_path = (custom_path or "").strip().strip('"')
-    if use_custom_path and custom_path:
+def resolve_input(mode, diffusion_model, checkpoint, text_encoder, custom_path):
+    """Resolve the target path based on the selected mode."""
+    if mode == "Custom Path":
+        custom_path = (custom_path or "").strip().strip('"')
+        if not custom_path:
+            raise ValueError("Mode is 'Custom Path' but no custom path was provided.")
         src = os.path.abspath(os.path.expanduser(custom_path))
         if os.path.isdir(src):
             files = sorted(glob.glob(os.path.join(src, "*.safetensors")))
@@ -86,8 +88,26 @@ def resolve_input(model_name, custom_path, use_custom_path):
         if os.path.isfile(src):
             return [src], os.path.dirname(src), os.path.splitext(os.path.basename(src))[0]
         raise ValueError(f"Path not found: {src}")
-    path = folder_paths.get_full_path("diffusion_models", model_name)
-    return [path], os.path.dirname(path), os.path.splitext(os.path.basename(path))[0]
+
+    elif mode == "Diffusion Model":
+        if not diffusion_model or diffusion_model == "None":
+            raise ValueError("No Diffusion Model selected. Please choose a model from the dropdown.")
+        path = folder_paths.get_full_path("diffusion_models", diffusion_model)
+        if not path:
+            raise ValueError(f"Diffusion Model not found: {diffusion_model}")
+        return [path], os.path.dirname(path), os.path.splitext(os.path.basename(path))[0]
+
+    elif mode == "Text-Encoder":
+        if not text_encoder or text_encoder == "None":
+            raise ValueError("No Text-Encoder selected. Please choose a model from the dropdown.")
+        path = folder_paths.get_full_path("text_encoders", text_encoder)
+        if not path:  # Fallback to check the clip folder
+            path = folder_paths.get_full_path("clip", text_encoder)
+        if not path:
+            raise ValueError(f"Text-Encoder not found: {text_encoder}")
+        return [path], os.path.dirname(path), os.path.splitext(os.path.basename(path))[0]
+
+    raise ValueError(f"Unknown mode: {mode}")
 
 
 def diffusion_models_dir():
@@ -102,6 +122,8 @@ def diffusion_models_dir():
 def load_aio_model(checkpoint_name):
     """Load an AIO checkpoint and return only its diffusion model state dict."""
     ckpt_path = folder_paths.get_full_path("checkpoints", checkpoint_name)
+    if not ckpt_path:
+        raise ValueError(f"Checkpoint not found: {checkpoint_name}")
     full_sd = comfy.utils.load_torch_file(ckpt_path, safe_load=True)
     sd = {k[len(AIO_MODEL_PREFIX):]: v for k, v in full_sd.items() if k.startswith(AIO_MODEL_PREFIX)}
     if not sd:
@@ -110,13 +132,7 @@ def load_aio_model(checkpoint_name):
 
 
 def pick_mxfp8_backend(device):
-    """Pick a working comfy_kitchen backend for MXFP8 quantization.
-
-    The 'cuda' backend passes float8 tensors through DLPack, which some torch
-    versions reject ('float8 types are not supported by dlpack'). Probe once
-    and fall back to the triton/eager backends, which do not use DLPack.
-    Returns None if the default auto-selected backend works.
-    """
+    """Pick a working comfy_kitchen backend for MXFP8 quantization."""
     probe = torch.randn(32, 32, device=device, dtype=torch.float32)
     try:
         TensorCoreMXFP8Layout.quantize(probe)
@@ -160,8 +176,6 @@ def dequantize_input(sd, metadata):
     if metadata and "_quantization_metadata" in metadata:
         quant_layers = json.loads(metadata["_quantization_metadata"]).get("layers", {})
 
-    # Embedded per-layer configs: '.comfy_quant' uint8 JSON tensors from previously quantized models.
-    # These must never be carried over into the output (a bf16 cast of them breaks ComfyUI's loader).
     for k in [k for k in sd if k.endswith(".comfy_quant")]:
         conf = sd.pop(k)
         layer = k[: -len(".comfy_quant")]
@@ -178,7 +192,6 @@ def dequantize_input(sd, metadata):
         if info.get("convrot") and fmt != "convrot_w4a4":
             raise ValueError(f"Input model contains ConvRot-rotated INT8 layers ('{layer}'). Use a higher precision source model.")
 
-    # ComfyUI scaled fp8 checkpoints: 'scaled_fp8' marker + per-layer '.scale_weight' keys
     if "scaled_fp8" in sd:
         sd.pop("scaled_fp8")
         for k in [k for k in sd if k.endswith(".scale_weight")]:
@@ -189,7 +202,6 @@ def dequantize_input(sd, metadata):
         for k in [k for k in sd if k.endswith(".scale_input")]:
             sd.pop(k)
 
-    # fp8/int8 weights with a '.weight_scale' sibling (comfy-kitchen style per-tensor scale)
     for k in list(sd.keys()):
         if k not in sd or not k.endswith(".weight"):
             continue
@@ -201,7 +213,6 @@ def dequantize_input(sd, metadata):
             elif v.dtype == torch.int8:
                 raise ValueError(f"int8 weight '{k}' has no '{k}_scale' tensor, cannot dequantize.")
 
-    # any leftover raw fp8 tensors: plain cast back to bf16
     for k, v in sd.items():
         if v.dtype in FP8_DTYPES:
             sd[k] = v.to(torch.bfloat16)
@@ -213,40 +224,51 @@ class StarUltimateModelConverter:
     @classmethod
     def INPUT_TYPES(s):
         configs = load_model_configs()
+        
+        # Text-Encoders
+        tenc_list = []
+        if "text_encoders" in folder_paths.folder_names_and_paths:
+            tenc_list.extend(folder_paths.get_filename_list("text_encoders") or [])
+        if "clip" in folder_paths.folder_names_and_paths:
+            tenc_list.extend(folder_paths.get_filename_list("clip") or [])
+        tenc_list = sorted(list(set(tenc_list)))
+        tenc_list.insert(0, "None") # Set None at the very top
+
+        # Diffusion Models
+        diff_list = folder_paths.get_filename_list("diffusion_models") or []
+        diff_list = sorted(diff_list)
+        diff_list.insert(0, "None") # Set None at the very top
+
+        # Checkpoints
+        ckpt_list = folder_paths.get_filename_list("checkpoints") or []
+        ckpt_list = sorted(ckpt_list)
+        ckpt_list.insert(0, "None") # Set None at the very top
+
         return {
             "required": {
-                "model_name": (folder_paths.get_filename_list("diffusion_models"), {
-                    "tooltip": "Select a model from your ComfyUI diffusion_models folder. This will be used unless 'Use Custom Path' or 'Use Model from AIO Checkpoint' is enabled."
+                "mode": (["Diffusion Model", "Checkpoint", "Text-Encoder", "Custom Path"], {
+                    "default": "Diffusion Model",
+                    "tooltip": "Select the source type. The script will only process the file selected in the corresponding dropdown below."
                 }),
+                "diffusion_model": (diff_list, {"tooltip": "Used if Mode is 'Diffusion Model'."}),
+                "checkpoint": (ckpt_list, {"tooltip": "Used if Mode is 'Checkpoint'. Extracts UNet only."}),
+                "text_encoder": (tenc_list, {"tooltip": "Used if Mode is 'Text-Encoder'. Shows models from both 'clip' and 'text_encoders' folders."}),
                 "model_type": (list(configs["models"].keys()), {
-                    "tooltip": "Choose the model architecture profile. This determines which layers to keep in high precision and which can be quantized safely."
+                    "tooltip": "Choose the model architecture profile."
                 }),
                 "target_format": (TARGET_FORMATS, {
-                    "default": "nvfp4",
-                    "tooltip": "Target quantization format: nvfp4 (smallest, NVIDIA only), fp8 (small, good quality), mxfp8 (OCP Microscaling 8-bit, hardware-efficient block scaling offering near FP16 quality), int8 (compatible), int8_convrot (int8 with Hadamard rotation, better quality), int4_convrot (int4 with Hadamard rotation, smallest size, requires SM 8.0+), fp16 (standard), fp32 (full precision)."
+                    "default": "nvfp4"
                 }),
                 "device": (["cuda", "cpu"], {
-                    "default": "cuda",
-                    "tooltip": "Device for conversion. CUDA is much faster if you have an NVIDIA GPU. CPU works for all systems but is slower."
+                    "default": "cpu"
                 }),
             },
             "optional": {
-                "use_custom_path": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Enable this to use a custom file path instead of selecting from the model list. When enabled, the path below will be used."
-                }),
                 "custom_path": ("STRING", {
                     "default": "",
                     "multiline": False,
                     "placeholder": "Enter path to .safetensors file or folder",
-                    "tooltip": "Full path to a .safetensors file or a folder containing model shards. Only used when 'Use Custom Path' is enabled. Supports HuggingFace cache folders."
-                }),
-                "use_aio_checkpoint": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Enable this to convert directly from an all-in-one checkpoint. ONLY the diffusion model (UNet) is extracted and converted - text encoder and VAE are NOT included. The result is saved to models/diffusion_models."
-                }),
-                "checkpoint_name": (folder_paths.get_filename_list("checkpoints"), {
-                    "tooltip": "Select an all-in-one checkpoint from your ComfyUI checkpoints folder. Only used when 'Use Model from AIO Checkpoint' is enabled. Only the diffusion model part will be converted."
+                    "tooltip": "Used only if Mode is set to 'Custom Path'."
                 }),
             },
         }
@@ -257,32 +279,31 @@ class StarUltimateModelConverter:
     CATEGORY = "Star"
     OUTPUT_NODE = True
 
-    def convert(self, model_name, model_type, target_format, device, use_custom_path=False, custom_path="", use_aio_checkpoint=False, checkpoint_name=None):
+    def convert(self, mode, diffusion_model, checkpoint, text_encoder, model_type, target_format, device, custom_path=""):
         configs = load_model_configs()
         blacklist, fp8_layers, preserve_extended = get_profile(configs, model_type)
         start_time = time.time()
 
-        print(f"🚀 [Star Ultimate Model Converter] Profile: {model_type} | Target: {target_format}")
+        print(f"🚀 [Star Ultimate Model Converter] Mode: {mode} | Profile: {model_type} | Target: {target_format}")
 
-        if use_aio_checkpoint:
-            if not checkpoint_name:
-                raise ValueError("'Use Model from AIO Checkpoint' is enabled but no checkpoint is selected.")
-            print(f"✂️ Extracting diffusion model from AIO checkpoint: {checkpoint_name}")
-            sd, ckpt_path = load_aio_model(checkpoint_name)
+        if mode == "Checkpoint":
+            if not checkpoint or checkpoint == "None":
+                raise ValueError("Mode is 'Checkpoint' but no checkpoint is selected. Please choose a model from the dropdown.")
+            print(f"✂️ Extracting diffusion model from AIO checkpoint: {checkpoint}")
+            sd, ckpt_path = load_aio_model(checkpoint)
             files = [ckpt_path]
             orig_meta = None
             base_name = os.path.splitext(os.path.basename(ckpt_path))[0]
             output_path = build_output_path(diffusion_models_dir(), base_name, target_format)
             input_bytes = sum(v.numel() * v.element_size() for v in sd.values())
         else:
-            files, out_dir, base_name = resolve_input(model_name, custom_path, use_custom_path)
+            files, out_dir, base_name = resolve_input(mode, diffusion_model, checkpoint, text_encoder, custom_path)
             output_path = build_output_path(out_dir, base_name, target_format)
             input_bytes = sum(os.path.getsize(f) for f in files)
             sd, orig_meta = load_input(files)
 
         temp_diffusers_meta = {}
         if orig_meta:
-            # Always keep the format to avoid wait_stream errors
             if "format" in orig_meta:
                 temp_diffusers_meta["format"] = orig_meta["format"]
             if "modelspec.architecture" in orig_meta:
@@ -318,8 +339,12 @@ class StarUltimateModelConverter:
                 pbar.update_absolute(i + 1)
 
                 if any(name in k for name in blacklist):
-                    new_sd[k] = v.to(dtype=torch.bfloat16)
-                    counts["kept bf16"] += 1
+                    if v.dtype.is_floating_point:
+                        new_sd[k] = v.to(dtype=torch.bfloat16)
+                        counts["kept bf16"] += 1
+                    else:
+                        new_sd[k] = v
+                        counts["kept"] += 1
                     continue
 
                 if v.ndim == 2 and ".weight" in k:
@@ -359,8 +384,6 @@ class StarUltimateModelConverter:
                     print(f"💎 {target_format.upper()}: {k}")
                     
                     try:
-                        # Workaround 1: .contiguous() garantiert ein sauberes Speicher-Layout, 
-                        # was externe Kernel-Abstürze bei der Quantisierung verhindert.
                         v_tensor_ready = v_tensor.float().contiguous()
 
                         if int8_convrot:
@@ -376,11 +399,8 @@ class StarUltimateModelConverter:
                         tensors = layout.state_dict_tensors(qdata, params)
                         
                         for suffix, tensor in tensors.items():
-                            # ComfyUI's safetensors reader has no F8_E8M0 dtype; its loader expects
-                            # E8M0 block scales stored as uint8 on disk and re-views them at load time.
                             if tensor.dtype == torch.float8_e8m0fnu:
                                 new_sd[f"{base_k_file}.weight{suffix}"] = tensor.view(torch.uint8).cpu()
-                            # Workaround 2: Wir tarnen fehleranfällige float8 DLPack-Transfers als uint8
                             elif tensor.dtype in FP8_DTYPES:
                                 new_sd[f"{base_k_file}.weight{suffix}"] = tensor.view(torch.uint8).cpu().view(tensor.dtype)
                             else:
@@ -398,13 +418,21 @@ class StarUltimateModelConverter:
                         
                     except Exception as e:
                         print(f"⚠️ Quantization failed for {k}: {e}")
-                        new_sd[k] = v.to(dtype=torch.bfloat16)
-                        counts["kept bf16"] += 1
+                        if v.dtype.is_floating_point:
+                            new_sd[k] = v.to(dtype=torch.bfloat16)
+                            counts["kept bf16"] += 1
+                        else:
+                            new_sd[k] = v
+                            counts["kept"] += 1
 
                     if device == "cuda": del v_tensor
                 else:
-                    new_sd[k] = v.to(dtype=torch.bfloat16)
-                    counts["kept bf16"] += 1
+                    if v.dtype.is_floating_point:
+                        new_sd[k] = v.to(dtype=torch.bfloat16)
+                        counts["kept bf16"] += 1
+                    else:
+                        new_sd[k] = v
+                        counts["kept"] += 1
 
         final_metadata = OrderedDict()
         if quant_map["layers"]:
@@ -422,12 +450,13 @@ class StarUltimateModelConverter:
         reduction = (1 - output_bytes / input_bytes) * 100 if input_bytes else 0
         print(f"✅ Done. Final size: {format_size(output_bytes)}")
 
-        if use_aio_checkpoint:
+        if mode == "Checkpoint":
             input_desc = f"diffusion model from AIO checkpoint {os.path.basename(files[0])}"
         elif len(files) > 1:
             input_desc = f"{len(files)} files from {os.path.basename(os.path.dirname(files[0]))}"
         else:
             input_desc = os.path.basename(files[0])
+            
         layers_desc = ", ".join(f"{n} {name}" for name, n in counts.most_common())
         status = "\n".join([
             f"✅ Success ({model_type} → {target_format})",
