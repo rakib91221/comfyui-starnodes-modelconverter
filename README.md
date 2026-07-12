@@ -1,6 +1,10 @@
-# ⭐ Starnodes Model Converter v1.1.0
+# ⭐ Starnodes Model Converter v1.2.0
 
 ComfyUI custom nodes for converting, quantizing and splitting diffusion models.
+Big thangs to ComfyUI Org for https://github.com/Comfy-Org/comfy-kitchen which made this possible!
+
+<img width="755" height="410" alt="image" src="https://github.com/user-attachments/assets/ab3d23ec-ab33-4427-a29e-4ed7c132876e" />
+
 
 **Included nodes:**
 
@@ -24,6 +28,7 @@ ComfyUI custom nodes for converting, quantizing and splitting diffusion models.
 
 The converter includes optimized profiles for:
 
+- NEW All types of text encoders!
 - **Flux Family**: Flux.1-dev, Flux.1-Fill, Flux.2-dev, Flux.2-Klein-9b
 - **Z-Image**: Z-Image-Turbo, Z-Image-Base
 - **Qwen**: Qwen-Image-Edit-2511, Qwen-Image-2512
