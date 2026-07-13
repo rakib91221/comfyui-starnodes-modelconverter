@@ -1,13 +1,9 @@
-# ⭐ Starnodes Model Converter v1.2.1
+# ⭐ Starnodes Model Converter v1.1.0
 
 ComfyUI custom nodes for converting, quantizing and splitting diffusion models.
-Big thangs to ComfyUI Org for https://github.com/Comfy-Org/comfy-kitchen which made this possible!
-
-<img width="755" height="410" alt="image" src="https://github.com/user-attachments/assets/ab3d23ec-ab33-4427-a29e-4ed7c132876e" />
-
 
 **Included nodes:**
-- **⭐ Star Model Layers Info**
+
 - **⭐ Star Ultimate Model Converter**: Convert and quantize diffusion models to various precision formats with intelligent layer-specific optimization
 - **⭐ Starnodes AIO Splitter**: Split all-in-one checkpoints into separate diffusion model, text encoder and VAE files
 
@@ -28,7 +24,6 @@ Big thangs to ComfyUI Org for https://github.com/Comfy-Org/comfy-kitchen which m
 
 The converter includes optimized profiles for:
 
-- NEW All types of text encoders!
 - **Flux Family**: Flux.1-dev, Flux.1-Fill, Flux.2-dev, Flux.2-Klein-9b
 - **Z-Image**: Z-Image-Turbo, Z-Image-Base
 - **Qwen**: Qwen-Image-Edit-2511, Qwen-Image-2512
