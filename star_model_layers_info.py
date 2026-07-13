@@ -41,6 +41,10 @@ class StarModelLayersInfo:
                 }),
             },
             "optional": {
+                "view_mode": (["Normal View", "Tree View"], {
+                    "default": "Normal View",
+                    "tooltip": "Normal View: Flat list of all layers. Tree View: Hierarchical grouped view with layer ranges."
+                }),
                 "use_file_path": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Enable this to use a custom file path instead of selecting from the model list."
@@ -60,7 +64,7 @@ class StarModelLayersInfo:
     CATEGORY = '⭐StarNodes/Model Tools'
     OUTPUT_NODE = True
 
-    def analyze(self, model_name, use_file_path=False, file_path=""):
+    def analyze(self, model_name, view_mode="Normal View", use_file_path=False, file_path=""):
         start_time = time.time()
         
         print("🔍 [Star Model Layers Info] Starting analysis...")
@@ -95,12 +99,12 @@ class StarModelLayersInfo:
             except:
                 pass
         
-        # Analyze layers
-        layer_info = []
+        # Analyze layers and collect data
+        layer_data = []
         layer_stats = Counter()
         total_params = 0
         
-        print("🔍 Analyzing layers...")
+        print(f"🔍 Analyzing layers in {view_mode}...")
         
         for key in sorted(keys):
             tensor = sd[key]
@@ -113,7 +117,6 @@ class StarModelLayersInfo:
             size_bytes = num_params * tensor.element_size()
             
             # Determine quantization info
-            quant_info = "None"
             storage_format = dtype_name
             
             # Check if this is a quantized weight
@@ -122,7 +125,6 @@ class StarModelLayersInfo:
                 
                 # Check for scale tensors (FP8, INT8)
                 if f"{key}_scale" in keys:
-                    quant_info = "Per-tensor scaled"
                     storage_format = f"{dtype_name} + scale"
                     layer_stats["scaled"] += 1
                 
@@ -130,49 +132,54 @@ class StarModelLayersInfo:
                 if base_key in quant_metadata:
                     meta = quant_metadata[base_key]
                     fmt = meta.get("format", "unknown")
-                    quant_info = fmt
                     
                     if fmt == "nvfp4":
-                        storage_format = "NVFP4 (4-bit)"
+                        storage_format = "NVFP4"
                         layer_stats["nvfp4"] += 1
                     elif fmt == "mxfp8":
-                        storage_format = "MXFP8 (8-bit microscaling)"
+                        storage_format = "MXFP8"
                         layer_stats["mxfp8"] += 1
                     elif fmt == "int8_tensorwise":
                         if meta.get("convrot"):
-                            storage_format = "INT8 ConvRot"
+                            storage_format = "INT8_CONVROT"
                             layer_stats["int8_convrot"] += 1
                         else:
                             storage_format = "INT8"
                             layer_stats["int8"] += 1
                     elif fmt == "convrot_w4a4":
-                        storage_format = "INT4 ConvRot"
+                        storage_format = "INT4_CONVROT"
                         layer_stats["int4_convrot"] += 1
                     elif fmt == "float8_e4m3fn":
-                        storage_format = "FP8 (e4m3fn)"
+                        storage_format = "F8_E4M3"
                         layer_stats["fp8"] += 1
                     else:
-                        storage_format = fmt
+                        storage_format = fmt.upper()
                         layer_stats[fmt] += 1
                 else:
                     layer_stats[dtype_name] += 1
             elif key.endswith("_scale"):
-                # Scale tensor
-                quant_info = "Scale tensor"
-                storage_format = f"{dtype_name} (scale)"
+                storage_format = f"{dtype_name}_SCALE"
                 layer_stats["scale_tensor"] += 1
             elif key.endswith(".comfy_quant"):
-                # Embedded quant config
-                quant_info = "Quant config"
-                storage_format = "JSON metadata"
+                storage_format = "METADATA"
                 layer_stats["metadata"] += 1
             else:
-                # Other tensors (biases, norms, etc.)
                 layer_stats[dtype_name] += 1
             
-            # Format layer info
-            info_line = f"{key:<80} | Shape: {str(shape):<20} | Storage: {storage_format:<30} | Params: {num_params:>12,} | Size: {format_size(size_bytes)}"
-            layer_info.append(info_line)
+            # Store layer data
+            layer_data.append({
+                "key": key,
+                "shape": shape,
+                "format": storage_format.upper(),
+                "params": num_params,
+                "size": size_bytes
+            })
+        
+        # Generate output based on view mode
+        if view_mode == "Tree View":
+            layer_info = self._build_tree_view(layer_data)
+        else:
+            layer_info = self._build_normal_view(layer_data)
         
         # Build summary
         duration = time.time() - start_time
@@ -200,10 +207,11 @@ class StarModelLayersInfo:
         # Combine summary and layer info
         full_info = "\n".join(summary_lines + layer_info)
         
-        # Save to file
+        # Save to file with view mode suffix
         output_dir = os.path.join(folder_paths.get_output_directory(), "modelinfo")
         os.makedirs(output_dir, exist_ok=True)
-        output_file = os.path.join(output_dir, f"{base_name}.txt")
+        view_suffix = "_tree" if view_mode == "Tree View" else "_normal"
+        output_file = os.path.join(output_dir, f"{base_name}{view_suffix}.txt")
         
         print(f"💾 Saving layer info to: {output_file}")
         with open(output_file, "w", encoding="utf-8") as f:
@@ -211,7 +219,7 @@ class StarModelLayersInfo:
         
         # Build status message
         status = "\n".join([
-            f"✅ Model analysis complete",
+            f"✅ Model analysis complete ({view_mode})",
             f"Model: {base_name}",
             f"Total layers: {len(keys)}",
             f"Total parameters: {total_params:,}",
@@ -226,6 +234,150 @@ class StarModelLayersInfo:
         print("="*60 + "\n")
         
         return (status, full_info)
+    
+    def _build_normal_view(self, layer_data):
+        """Build flat list view of all layers."""
+        lines = []
+        for layer in layer_data:
+            line = f"{layer['key']:<80} | Shape: {str(layer['shape']):<20} | Format: {layer['format']:<20} | Params: {layer['params']:>12,} | Size: {format_size(layer['size'])}"
+            lines.append(line)
+        return lines
+    
+    def _build_tree_view(self, layer_data):
+        """Build hierarchical tree view with layer grouping."""
+        from collections import defaultdict
+        import re
+        
+        # Build tree structure
+        tree = defaultdict(list)
+        for layer in layer_data:
+            parts = layer['key'].split('.')
+            if len(parts) > 1:
+                # Group by first level (e.g., "blocks", "double_blocks")
+                prefix = parts[0]
+                tree[prefix].append(layer)
+            else:
+                tree['_root'].append(layer)
+        
+        lines = []
+        
+        for prefix in sorted(tree.keys()):
+            layers = tree[prefix]
+            if not layers:
+                continue
+            
+            # Group consecutive numbered layers
+            grouped = self._group_consecutive_layers(layers)
+            
+            # Calculate total size and formats for this prefix
+            total_size = sum(l['size'] for l in layers)
+            formats = sorted(set(l['format'] for l in layers))
+            formats_str = ", ".join(formats)
+            
+            # Print prefix header
+            if prefix == '_root':
+                lines.append(f"├── Root ({format_size(total_size)} | {formats_str})")
+            else:
+                lines.append(f"├── {prefix} ({format_size(total_size)} | {formats_str})")
+            
+            # Print grouped layers
+            for group in grouped:
+                if group['is_range']:
+                    # Range of layers
+                    total_group_size = sum(l['size'] for l in group['layers'])
+                    group_formats = sorted(set(l['format'] for l in group['layers']))
+                    group_formats_str = ", ".join(group_formats)
+                    lines.append(f"│   ├── [{group['start']}-{group['end']}] ({format_size(total_group_size)} | {group_formats_str})")
+                    
+                    # Show sub-components of the range
+                    subcomponents = defaultdict(list)
+                    for layer in group['layers']:
+                        # Extract component name (e.g., "attn", "mlp", "norm")
+                        parts = layer['key'].split('.')
+                        if len(parts) > 2:
+                            component = '.'.join(parts[2:])  # Everything after the number
+                            subcomponents[component].append(layer)
+                    
+                    for comp_name in sorted(subcomponents.keys()):
+                        comp_layers = subcomponents[comp_name]
+                        comp_size = sum(l['size'] for l in comp_layers)
+                        comp_formats = sorted(set(l['format'] for l in comp_layers))
+                        comp_formats_str = ", ".join(comp_formats)
+                        lines.append(f"│   │   ├── {comp_name} ({format_size(comp_size)} | {comp_formats_str})")
+                else:
+                    # Single layer
+                    layer = group['layers'][0]
+                    lines.append(f"│   ├── {layer['key']} ({format_size(layer['size'])} | {layer['format']})")
+        
+        return lines
+    
+    def _group_consecutive_layers(self, layers):
+        """Group consecutive numbered layers together."""
+        import re
+        
+        # Extract layer numbers
+        numbered = []
+        unnumbered = []
+        
+        for layer in layers:
+            match = re.search(r'\.(\d+)\.', layer['key'])
+            if match:
+                num = int(match.group(1))
+                numbered.append((num, layer))
+            else:
+                unnumbered.append(layer)
+        
+        # Sort by number
+        numbered.sort(key=lambda x: x[0])
+        
+        # Group consecutive numbers
+        groups = []
+        if numbered:
+            current_group = [numbered[0]]
+            
+            for i in range(1, len(numbered)):
+                if numbered[i][0] == current_group[-1][0] + 1:
+                    current_group.append(numbered[i])
+                else:
+                    # Finish current group
+                    if len(current_group) >= 3:  # Only group if 3+ consecutive
+                        groups.append({
+                            'is_range': True,
+                            'start': current_group[0][0],
+                            'end': current_group[-1][0],
+                            'layers': [l for _, l in current_group]
+                        })
+                    else:
+                        for _, layer in current_group:
+                            groups.append({
+                                'is_range': False,
+                                'layers': [layer]
+                            })
+                    current_group = [numbered[i]]
+            
+            # Add last group
+            if len(current_group) >= 3:
+                groups.append({
+                    'is_range': True,
+                    'start': current_group[0][0],
+                    'end': current_group[-1][0],
+                    'layers': [l for _, l in current_group]
+                })
+            else:
+                for _, layer in current_group:
+                    groups.append({
+                        'is_range': False,
+                        'layers': [layer]
+                    })
+        
+        # Add unnumbered layers
+        for layer in unnumbered:
+            groups.append({
+                'is_range': False,
+                'layers': [layer]
+            })
+        
+        return groups
 
 
 NODE_CLASS_MAPPINGS = {"StarModelLayersInfo": StarModelLayersInfo}
